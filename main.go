@@ -14,7 +14,9 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"log"
 	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strconv"
@@ -50,10 +52,10 @@ var (
 	green  = color.RGBA{0, 255, 0, 0}
 
 	// tracking
-	tracking                 = false
+	tracking                 = true
 	detected                 = false
 	detectSize               = false
-	distTolerance            = 0.05 * dist(0, 0, frameX, frameY)
+	distTolerance            = 0.01 * dist(0, 0, frameX, frameY)
 	refDistance              float64
 	left, top, right, bottom float64
 
@@ -61,6 +63,8 @@ var (
 	drone      = tello.NewDriver("8890")
 	flightData *tello.FlightData
 )
+
+var launchTime = time.Time{}
 
 func init() {
 	// process drone events in separate goroutine for concurrency
@@ -78,6 +82,8 @@ func init() {
 		drone.On(tello.ConnectedEvent, func(data interface{}) {
 			fmt.Println("Connected")
 			drone.TakeOff()
+			drone.Up(15)
+			launchTime = time.Now()
 
 			drone.StartVideo()
 			drone.SetVideoEncoderRate(tello.VideoBitRateAuto)
@@ -152,6 +158,9 @@ func main() {
 	}
 }
 
+var lastResetAt = time.Time{}
+var rotation = false
+
 func trackFace(frame *gocv.Mat) {
 	W := float64(frame.Cols())
 	H := float64(frame.Rows())
@@ -167,9 +176,11 @@ func trackFace(frame *gocv.Mat) {
 	detections := gocv.GetBlobChannel(detBlob, 0, 0)
 	defer detections.Close()
 
+	low := 0
 	for r := 0; r < detections.Rows(); r++ {
 		confidence := detections.GetFloatAt(r, 2)
 		if confidence < 0.5 {
+			low++
 			continue
 		}
 
@@ -184,12 +195,32 @@ func trackFace(frame *gocv.Mat) {
 		top = math.Min(math.Max(0.0, top), H-1.0)
 
 		detected = true
+		drone.FrontFlip()
 		rect := image.Rect(int(left), int(top), int(right), int(bottom))
 		gocv.Rectangle(frame, rect, green, 3)
 	}
 
+	// TODO: Reset detected state.
+	log.Printf("detected: %v; low: %d\n", detected, low)
+
 	if !tracking || !detected {
 		return
+	}
+
+	// Detected. Sleep for course correction.
+	diff := time.Now().Sub(lastResetAt)
+	if diff < time.Duration(5*time.Second) {
+		log.Printf("delta: %v\n", diff)
+
+		log.Println("backwards correction")
+		drone.Backward(1)
+		drone.BackFlip()
+		detected = false
+		lastResetAt = time.Now()
+	}
+
+	if rand.Intn(20) == 0 {
+		rotation = !rotation
 	}
 
 	if detectSize {
@@ -200,33 +231,49 @@ func trackFace(frame *gocv.Mat) {
 	distance := dist(left, top, right, bottom)
 
 	// x axis
+	log.Printf("left: %v; right: %v; W: %v\n", left, right, W)
 	switch {
 	case right < W/2:
-		drone.CounterClockwise(50)
+		log.Println("counter clockwise")
+		drone.CounterClockwise(25)
 	case left > W/2:
-		drone.Clockwise(50)
+		log.Println("clockwise")
+		drone.Clockwise(25)
 	default:
-		drone.Clockwise(0)
+		log.Println("random rotation")
+		if rotation {
+			drone.Clockwise(25)
+		} else {
+			drone.CounterClockwise(25)
+		}
 	}
 
 	// y axis
+	log.Printf("top: %v; bottom: %v; H: %v\n", top, bottom, H)
 	switch {
 	case top < H/10:
-		drone.Up(25)
+		// drone.Up(25)
 	case bottom > H-H/10:
-		drone.Down(25)
+		// log.Println("down")
+		// drone.Down(5)
 	default:
-		drone.Up(0)
+		// log.Println("up 0")
+		// drone.Up(0)
 	}
 
 	// z axis
+	log.Printf("distance: %v; refDistance: %v; distTolerance: %v\n", distance, refDistance, distTolerance)
 	switch {
 	case distance < refDistance-distTolerance:
+		log.Println("forward")
 		drone.Forward(20)
 	case distance > refDistance+distTolerance:
-		drone.Backward(20)
-	default:
-		drone.Forward(0)
+		// log.Println("backward")
+		// drone.Backward(5)
+		log.Println("forward")
+		drone.Forward(20)
+		// default:
+		// drone.Forward(0)
 	}
 }
 
